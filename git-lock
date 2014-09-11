@@ -1,0 +1,192 @@
+#!/bin/bash
+
+if [[ -z "$GIT_LOCK_DIR" ]]; then
+	GIT_LOCK_DIR=/tmp # Default
+fi
+
+VERBOSITY=0
+FORCE=0
+
+read -r -d '' HELP <<'EOF'
+  $0 - A git subcommand that creates semaphores (locks) for given files
+
+EXAMPLES
+  $0 -v SPI_master docs/specification.docx
+
+USAGE
+  $0 <options> <file_to_lock>
+
+OPTIONS
+  -f
+  --force        - Forcibly lock the file (can still fail)
+  -v
+  --verbose      - Increase the verbosity
+  --verbose=\d   - Set the verbosity; this can be used in conjunction with the
+                   normal -v and --verbose options to set the verbosity to a
+                   minimum level
+  -h
+  --help         - Show this help and exit
+
+OVERVIEW
+  This command ends up creating .lock files for each repository/file
+  combination in a centralized location (controlled by the GIT_LOCK_DIR
+  environment variable). This means that as long as a repository name is the
+  same for all users the files will be locked appropriately. In other words,
+  this subcommand is heavily reliant on the proper use of a central git server
+  such as Github [1] or Gitlab [2].
+
+  This command attempts to enforce atomic operations as much as possible, but
+  it is inevitably limited by the underlying filesystem. It may not work in
+  heavily trafficked environments where there are many users trying to
+  lock/unlock the same file/s at the same time.
+
+  This command is part of the locking-git suite of commands and aliases.
+
+  [1] https://www.github.com
+  [2] https://www.gitlab.com
+
+PITFALLS
+  * Files from different repositories will be different.
+  * Concurrent lock/unlock attempts may step on each other. And while this is
+    worked around as much as possible, some collisions may nevertheless occur.
+EOF
+
+file=""
+
+for arg in $@; do
+	# Long options
+	if [[ "$arg" == "--verbose" ]]; then
+		VERBOSITY=$(( $VERBOSITY + 1 ))
+	elif [[ "$arg" =~ --verbose=[[:digit:]]+ ]]; then
+		VERBOSITY=$(echo $arg | sed 's/^--verbose=\([[:digit:]]\+\)/\1/')
+	elif [[ "$arg" == "--force" ]]; then
+		FORCE=1
+	elif [[ "$arg" == "--help" ]]; then
+		echo $HELP
+		exit
+	elif [[ "$arg" == -* ]]; then
+		for short_arg in $(echo $arg | sed 's/^-//'); do
+			if [[ "$short_arg" == "v" ]]; then
+				VERBOSITY=$(( $VERBOSITY + 1 ))
+			elif [[ "$short_arg" == "f" ]]; then
+				FORCE=1
+			elif [[ "$short_arg" == "h" ]]; then
+				echo $HELP
+				exit
+			else
+				echo "Error: Unknown option '-${short_arg}'."
+				exit -1
+			fi
+		done
+	elif [[ -z "file" ]]; then
+		file="$arg"
+	else
+		echo "Error: Unknown argument '$arg'."
+		exit -1
+	fi
+done
+
+if [[ -z "$file" ]]; then
+	echo "No file specified; exiting."
+	exit -1
+fi
+
+git remote show origin > /dev/null
+if [[ $? -ne 0 ]]; then
+	echo "No remote named 'origin' found. Please run"
+	echo
+	echo "    git remote add origin <url>"
+	echo
+	echo "and run git $SUBCOMMAND again"
+	echo
+	exit -2
+fi
+repo_name=$(git remote show origin | grep Fetch | sed 's|^[[:space:]]*Fetch[[:space:]]\+URL: .*/\([[:alnum:]]\+\).git$|\1|')
+if [[ $VERBOSITY -gt 1 ]]; then echo "Repository name: '$repo_name'"; fi
+
+
+function check_owners() {
+	check_user=$1
+	allowed_users=("${!2}")
+
+	for user in ${allowed_users[@]}; do
+		if [[ "$user" == "$check_user" ]]; then
+			return 0
+		fi
+	done
+
+	return -1
+}
+
+
+function check_for_lock() {
+	allowed_users=("${!1}") # Guaranteed to not have spaces
+	shift
+	file="$@"
+
+	lock_file="${GIT_LOCK_DIR}/${repo_name}/${file}.lock"
+
+	# TODO: This probably is not platform-agnostic
+	lock_file_info=$([[ -e $lock_file ]] && stat ${lock_file} || exit -2) # Do this once
+	lock_file_info_status=$?
+	lock_file_info_error=$!
+	lock_file_group=$(echo $lock_file_info | awk '{ print $6 }')
+	lock_file_owner=$(echo $lock_file_info | awk '{ print $5 }')
+	lock_file_atime=$(echo $lock_file_info | awk -F\" '{ print $2 }')
+
+	# If the file exists then there could be contention
+	if [[ $lock_file_info_status -eq 0 && !$(check_owners $lock_file_owner allowed_users[@]) ]]; then
+		# The file is locked to somebody else
+		# Let the user know who has it, when it was last accessed, and what they
+		# can do to manually remove the lock, then exit
+		echo
+		echo "Error: Unable to lock $repo_name/$file."
+		echo
+		echo "       Current lock owner: $lock_file_owner"
+		echo "       Last access time: $lock_file_atime"
+		echo
+		echo "       To remove this lock, please run:"
+		echo
+		echo "           git unlock ${repo_name} ${file}"
+		echo
+		echo "       or contact your system administrator."
+		echo
+		exit -1
+	fi
+
+	return 0
+}
+
+
+function create_file_lock() {
+	user="$1"
+	shift
+	file="$@"
+
+	lock_file="${GIT_LOCK_DIR}/${repo_name}/${file}.lock"
+
+	touch $lock_file
+	chown $user $lock_file
+
+	return $?
+}
+
+
+current_user=$(whoami)
+current_user_or_nobody=($current_user "nobody")
+
+# The magic
+if [[ $FORCE -eq 1 ]]; then
+	check_for_lock current_user_or_nobody[@] $file
+	# Continue on regardless
+	create_file_lock $current_user $file && \
+	check_for_lock $current_user $file && \
+	exit 0 || \
+	exit -1
+else
+	check_for_lock current_user_or_nobody[@] $file && \
+	create_file_lock $current_user $file && \
+	check_for_lock $current_user $file && \
+	exit 0 || \
+	exit -1
+fi

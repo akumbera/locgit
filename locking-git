@@ -1,0 +1,186 @@
+#!/bin/bash
+
+GIT_LOCK_DIR=/tmp
+
+read -r -d '' HELP <<'EOF'
+$0 - A wrapper around git that locks and unlocks binary files
+EOF
+
+VERBOSITY=0
+FORCE=0
+GIT_SUBCOMMAND="$1"
+shift # Get rid of the subcommand
+GIT_LOCK_ARGS=""
+GIT_UNLOCK_ARGS=""
+GIT_SUBCOMMAND_ARGUMENTS=() # Not options
+branch="master" # Allow subcommands to override this
+binary_files=()
+
+for arg in $@; do
+	# Long options
+	if [[ "$arg" == "--verbose" ]]; then
+		VERBOSITY=$(( $VERBOSITY + 1 ))
+		GIT_LOCK_ARGS="$GIT_LOCK_ARGS --verbose"
+		GIT_UNLOCK_ARGS="$GIT_UNLOCK_ARGS --verbose"
+	elif [[ "$arg" =~ --verbose=[[:digit:]]+ ]]; then
+		VERBOSITY=$(echo $arg | sed 's/^--verbose=\([[:digit:]]\+\)/\1/')
+		GIT_LOCK_ARGS="$GIT_LOCK_ARGS --verbose=$VERBOSITY"
+		GIT_UNLOCK_ARGS="$GIT_UNLOCK_ARGS --verbose=$VERBOSITY"
+	elif [[ "$arg" == "--force" ]]; then
+		FORCE=1
+		GIT_LOCK_ARGS="$GIT_LOCK_ARGS --force"
+		GIT_UNLOCK_ARGS="$GIT_UNLOCK_ARGS --force"
+	elif [[ "$arg" == "--help" ]]; then
+		echo $HELP
+		exit
+	elif [[ "$arg" == -* ]]; then
+		for short_arg in $(echo $arg | sed 's/^-//'); do
+			if [[ "$short_arg" == "v" ]]; then
+				VERBOSITY=$(( $VERBOSITY + 1 ))
+				GIT_LOCK_ARGS="$GIT_LOCK_ARGS -v"
+				GIT_UNLOCK_ARGS="$GIT_UNLOCK_ARGS -v"
+			elif [[ "$short_arg" == "f" ]]; then
+				FORCE=1
+				GIT_LOCK_ARGS="$GIT_LOCK_ARGS -f"
+				GIT_UNLOCK_ARGS="$GIT_UNLOCK_ARGS -f"
+			elif [[ "$short_arg" == "h" ]]; then
+				echo $HELP
+				exit
+			else
+				echo "Error: Unknown option '-${short_arg}'."
+				exit -1
+			fi
+		done
+	else
+		GIT_SUBCOMMAND_ARGUMENTS+=("$arg")
+	fi
+done
+
+
+function get_binary_files() {
+	binary_file_list_files="/etc/binary-files ~/.binary-files ./.binary-files"
+	joined_binary_file_extensions=$(cat $binary_file_list_files | sort -u | grep -v '^$' | tr '\n' '|' | sed 's/|$//')
+	if [[ $VERBOSITY -gt 3 ]]; then echo "Finding binary files that match the following pattern/s:"; cat $binary_file_list_files; fi
+
+	binary_files=$(git ls-tree -r --name-only $branch | egrep "$joined_binary_file_extensions")
+}
+
+
+git remote show origin > /dev/null
+if [[ $? -ne 0 ]]; then
+	echo "No remote named 'origin' found. Please run"
+	echo
+	echo "    git remote add origin <url>"
+	echo
+	echo "and run git $SUBCOMMAND again"
+	echo
+	exit -2
+fi
+repo_name=$(git remote show origin | grep Fetch | sed 's|^[[:space:]]*Fetch[[:space:]]\+URL: .*/\([[:alnum:]]\+\).git$|\1|')
+if [[ $VERBOSITY -gt 1 ]]; then echo "Repository name: '$repo_name'"; fi
+
+
+
+if [[ "${GIT_SUBCOMMAND}" == "pull" ]]; then
+	# All of the subcommands that WANT to lock files
+	if [[ ${#GIT_SUBCOMMAND_ARGUMENTS[@]} -gt 1 ]]; then
+		branch=${GIT_SUBCOMMAND_ARGUMENTS[2]}
+	fi
+
+	\git ${GIT_SUBCOMMAND} $@
+
+	get_binary_files()
+
+	locked_files=( "${binary_files[@]}" )
+	for file in $binary_files; do
+		if [[ $VERBOSITY -gt 2 ]]; then for file in $binary_files; do echo "Attempting to lock '$repo_name/$file'"; done; fi
+		GIT_LOCK_DIR=${GIT_LOCK_DIR} git lock ${GIT_LOCK_ARGS} $file
+		if [[ $? -ne 0 ]]; then
+			echo "Cannot get a lock on $file; setting local copy to read-only permissions"
+			chmod u-w $file
+			chmod g-w $file
+		fi
+	done
+
+elif [[ "${GIT_SUBCOMMAND}" == "checkout" ]]; then
+	# All of the subcommands that NEED to lock files
+	branch=${GIT_SUBCOMMAND_ARGUMENTS[1]}
+
+	get_binary_files()
+
+	# TODO: Trap sigint and just have it stop and unlock all locked files
+
+	locked_files=()
+	for file in $binary_files; do
+		if [[ $VERBOSITY -gt 2 ]]; then for file in $binary_files; do echo "Attempting to lock '$repo_name/$file'"; done; fi
+		GIT_LOCK_DIR=${GIT_LOCK_DIR} git lock ${GIT_LOCK_ARGS} $file
+		# Need to save a record of which files were locked in case a later lock fails
+		if [[ $? -eq 0 ]]; then
+			locked_files+=($file)
+		else
+			# Unlock all locked files
+			for locked_file in ${locked_files[@]}; do
+				GIT_LOCK_DIR=${GIT_LOCK_DIR} git unlock ${GIT_UNLOCK_ARGS} $locked_file
+				file_was_unlocked=$(locked_file)
+				# Remove the unlocked file from the list of locked files
+				locked_files=( "${locked_files[@]/$file_was_unlocked}" )
+			done
+			# Check that we unlocked all of the files we locked
+			if [[ ${#locked_files[@]} ]]; then
+				echo "Warning: Unable to unlock all files previously locked, please run:"
+				echo
+				for bad_locked_file in ${locked_files[@]}; do
+					echo "    rm ${LOCK_DIR}/${repo_name}/${bad_locked_file}.lock"
+				done
+				echo
+				echo "          to remove the lock/s manually."
+				echo
+				echo "          If that doesn't work, please contact your system administrator."
+				echo
+			fi
+
+			# If we didn't get a successful lock, bail
+			break
+		fi
+	done
+
+	\git $GIT_SUBCOMMAND $@
+
+elif [[ "${GIT_SUBCOMMAND}" == "push" ]]; then
+	# All of the subcommands that need to unlock binary files
+	remote=${GIT_SUBCOMMAND_ARGUMENTS[1]}
+	if [[ ${#GIT_SUBCOMMAND_ARGUMENTS[@]} -gt 1 ]]; then
+		branch=${GIT_SUBCOMMAND_ARGUMENTS[2]}
+	fi
+
+	get_binary_files()
+
+	locked_files=${binary_files[@]}
+
+	# Unlock all locked files
+	for locked_file in ${locked_files[@]}; do
+		GIT_LOCK_DIR=${GIT_LOCK_DIR} git unlock ${GIT_UNLOCK_ARGS} $locked_file
+		if [[ $? -eq 0 ]]; then
+			file_was_unlocked=$(locked_file)
+			# Remove the unlocked file from the list of locked files
+			locked_files=( "${locked_files[@]/$file_was_unlocked}" )
+		fi
+	done
+	# Check that we unlocked all of the files we locked
+	if [[ ${#locked_files[@]} ]]; then
+		echo "Warning: Unable to unlock all files previously locked, please run:"
+		echo ""
+		for bad_locked_file in ${locked_files[@]}; do
+			echo "    rm ${LOCK_DIR}/${repo_name}/${bad_locked_file}.lock"
+		done
+		echo ""
+		echo "          to remove the lock/s manually."
+		echo ""
+		echo "          If that doesn't work, please contact your system administrator."
+		echo ""
+	fi
+
+	\git $GIT_SUBCOMMAND $@
+else
+	\git $GIT_SUBCOMMAND $@
+fi
